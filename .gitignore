@@ -1,0 +1,48 @@
+# ---------------------------------------------------------------
+# SECRETS - never commit these
+# ---------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+providers.json
+
+# ---------------------------------------------------------------
+# Meeting data - transcripts may contain confidential conversation
+# ---------------------------------------------------------------
+sessions/
+transcript-*.txt
+transcript-*.md
+transcript-*.srt
+
+# ---------------------------------------------------------------
+# Speech models (gigabytes - downloaded via the in-app manager)
+# ---------------------------------------------------------------
+models/
+
+# Screenshots in docs/ ARE committed - only stray images are ignored
+*.png
+*.jpg
+!docs/*.png
+
+# ---------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store

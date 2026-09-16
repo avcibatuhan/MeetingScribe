@@ -1,0 +1,12 @@
+# Core
+PySide6>=6.6            # desktop UI
+websockets>=12.0        # Deepgram live streaming
+numpy>=1.24             # audio mixing
+
+# Windows only - system audio capture (WASAPI loopback).
+# Linux uses parec from pulseaudio-utils, no pip package needed.
+soundcard>=0.4.3 ; sys_platform == "win32"
+
+# Local Whisper mode (optional - skip if you only use Deepgram)
+faster-whisper>=1.0
+huggingface_hub>=0.21   # downloads models from the in-app manager

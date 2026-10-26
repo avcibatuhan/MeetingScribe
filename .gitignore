@@ -6,6 +6,11 @@
 !.env.example
 *.key
 *.pem
+# ssh keys - never belong in a repo
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*.pub
 providers.json
 
 # ---------------------------------------------------------------

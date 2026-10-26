@@ -46,6 +46,9 @@ fallbacks. Whisper models download from inside the app.*
 | **Translation** | 10 languages, one click, batched to stay cheap |
 | **Your own voice too** | Mixes in your microphone, with automatic ducking |
 | **"What should I say?"** | Drafts a natural reply from the last few minutes |
+| **Summary & action items** | Written automatically when you stop — decisions, tasks, owners, deadlines |
+| **Ask the meeting** | "When is the launch?" — answered from the transcript, with the time it came up |
+| **Search everything** | Find any word across every saved meeting, jump straight to the line |
 | **Works offline** | Whisper on your GPU — no audio leaves the machine |
 | **Saved meetings** | Autosaves; browse, reopen and export later |
 
@@ -61,7 +64,7 @@ python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-python3 hybrid_translator.py
+python3 meetingscribe.py
 ```
 
 On first launch, open **🔑 API Keys** in the sidebar and paste in a key.
@@ -120,6 +123,27 @@ When you speak, the meeting audio automatically **ducks** (drops to a quarter)
 so your voice isn't buried under it. Both the mic level and the duck amount
 are adjustable under **🎙 Audio**.
 
+### Summary and action items
+
+When you press **Stop**, MeetingScribe reads the whole meeting and writes a
+short summary in your translation language, with:
+
+- **Decisions** — what was agreed
+- **Action items** — the task, who owns it, and when it's due (only if someone
+  actually said so; it never invents owners or dates)
+- **Open questions** — raised but not settled
+
+It's saved with the session and included in `.txt` / `.md` exports. Press
+**📝 Summarize meeting** to refresh it; the card says *out of date* when new
+lines have come in since.
+
+### Ask about the meeting
+
+Type a question under the summary — *"What did they say about pricing?"*,
+*"Who is preparing the budget?"* — and it's answered from the transcript only,
+in the language you asked in. If the meeting didn't cover it, it says so
+rather than guessing.
+
 ### What should I say?
 
 Reads the last 15 lines and drafts something natural you could say next, at
@@ -166,6 +190,10 @@ guessing something that merely sounds like it. Restart to apply.
 Sessions autosave every 30 seconds and again when you stop. Open **🕘 History**
 to reopen, export or delete them.
 
+The search box at the top looks through **every** saved meeting — transcript,
+translations and summaries. Results show the matching line highlighted;
+**Open** jumps straight to it.
+
 Export formats: **`.txt`**, **`.md`** (side by side), **`.srt`** (subtitles).
 
 Transcripts are stored locally at `0600` and are gitignored — meeting content
@@ -195,11 +223,11 @@ Everything is editable in the app. If you'd rather use a file, copy
 
 ```bash
 TRANSCRIBE_MODE=deepgram     # or: local
-TRANSLATE_MODE=gemini        # or: openai, off
 TARGET_LANGUAGE=Turkish
 CAPTURE_MIC=1                # include your own voice
 MIC_DUCK=0.25                # how far others drop while you speak
 BATCH_SIZE=20                # lines per translation request
+AUTO_SUMMARY=1               # summarize automatically when you stop
 ```
 
 ---

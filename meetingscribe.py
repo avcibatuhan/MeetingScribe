@@ -1,35 +1,16 @@
 """
-Live meeting transcription + translation, with a CLOUD / LOCAL switch.
+MeetingScribe - live transcription and translation for online meetings.
 
-  CLOUD  - streams audio to Deepgram (fast, speaker labels, costs money)
-  LOCAL  - runs Whisper large-v3-turbo on your own GPU (free, private,
-           no speaker labels)
+Listens to whatever the computer plays (Zoom, Teams, Meet, ...) plus,
+optionally, your microphone. Transcribes it with Deepgram (cloud, speaker
+labels) or Whisper (local GPU), translates it with any LLM provider added
+under "API Keys", and saves every session to History.
 
-Flip between them with the toggle in the top bar; the rest of the app
-behaves the same either way.
+    pip install -r requirements.txt
+    python3 meetingscribe.py
 
-Setup (once):
-    pip3 install --user websockets
-
-    # for LOCAL mode, build the turbo model once (~1.6GB, no re-download
-    # if you already have the HF copy):
-    ct2-transformers-converter --model openai/whisper-large-v3-turbo \
-        --output_dir ./models/whisper-large-v3-turbo-ct2 \
-        --copy_files tokenizer.json preprocessor_config.json \
-        --quantization float16
-
-.env next to this script:
-    DEEPGRAM_API_KEY=...
-    GEMINI_API_KEY=...                  # used for translation if present
-    GEMINI_MODEL=gemini-2.5-flash
-
-  ...or any OpenAI-compatible provider instead:
-    TRANSLATE_API_KEY=...
-    TRANSLATE_BASE_URL=https://api.groq.com/openai/v1
-    TRANSLATE_MODEL=llama-3.3-70b-versatile
-
-Run:
-    python3 live_translator.py
+Configuration lives in .env (see .env.example) and providers.json, both of
+which are edited from inside the app.
 """
 
 import asyncio
@@ -45,7 +26,7 @@ from datetime import datetime
 
 import websockets
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel,
     QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
@@ -127,34 +108,18 @@ def flag(name, default="0"):
 #  EVERYTHING BELOW IS DRIVEN BY .env - THIS IS THE ONLY PLACE TO CONFIGURE
 #
 #    TRANSCRIBE_MODE = local | deepgram      (speech -> text)
-#    TRANSLATE_MODE  = gemini | openai | off           (text -> translation)
+#    translation providers live in providers.json (edit under "API Keys")
 #    DEBUG           = 1                     (log to the console)
 # =======================================================================
 
 TRANSCRIBE_MODE = ENV.get("TRANSCRIBE_MODE", "local").strip().lower()
-TRANSLATE_MODE = ENV.get("TRANSLATE_MODE", "gemini").strip().lower()
 DEBUG = flag("DEBUG", "1")
 
 # --- keys ---
 DEEPGRAM_KEY = ENV.get("DEEPGRAM_API_KEY") or os.environ.get("DEEPGRAM_API_KEY", "")
-GEMINI_KEY = ENV.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
-TRANSLATE_KEY = ENV.get("TRANSLATE_API_KEY") or os.environ.get("TRANSLATE_API_KEY", "")
 
-# --- gemini ---
-# translation model chain, tried in order:
-#   1. gemini-3.5-flash-lite   free tier, ~0.7s, handles everything normally
-#   2. gemini-3.7-flash        free tier, used when 1 is rate limited
-#   3. whatever PAID_* points at, on a separate billed key - last resort
-GEMINI_MODEL = ENV.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
-GEMINI_FALLBACKS = [m.strip() for m in ENV.get(
-    "GEMINI_FALLBACKS", "gemini-3.7-flash").split(",") if m.strip()]
-
-# optional billed key. left empty until you buy one; the app just skips this
-# tier while it is blank.
-PAID_API_KEY = ENV.get("PAID_API_KEY") or os.environ.get("PAID_API_KEY", "")
-PAID_MODEL = ENV.get("PAID_MODEL", "gemini-3.5-flash-lite")
-GEMINI_ACTIVE = GEMINI_MODEL
-GEMINI_TIMEOUT = float(ENV.get("GEMINI_TIMEOUT", "30"))
+# --- llm requests ---
+REQUEST_TIMEOUT = float(ENV.get("REQUEST_TIMEOUT", ENV.get("REQUEST_TIMEOUT", "30")))
 
 # batching: how many transcript lines go into ONE api request, and how long
 # we wait to fill a batch. this is what keeps us under the per-minute /
@@ -181,10 +146,6 @@ CEFR_LEVELS = {
                      "richer vocabulary where it fits.",
 }
 DEFAULT_CEFR = ENV.get("CEFR_LEVEL", "B2 · natural")
-
-# --- openai-compatible provider (groq / openai / xai / ...) ---
-TRANSLATE_BASE = ENV.get("TRANSLATE_BASE_URL", "https://api.groq.com/openai/v1")
-TRANSLATE_MODEL = ENV.get("TRANSLATE_MODEL", "llama-3.3-70b-versatile")
 
 # --- local whisper ---
 import audio as audio_backend
@@ -221,10 +182,6 @@ def active_model_dir():
 
 # --- derived state (do not set these in .env) ---
 PROVIDERS = []              # filled in below, once helpers are defined
-USE_GEMINI = TRANSLATE_MODE == "gemini" and bool(GEMINI_KEY)
-USE_OPENAI = TRANSLATE_MODE in ("openai", "groq") and bool(TRANSLATE_KEY)
-HAVE_TRANSLATION = USE_GEMINI or USE_OPENAI
-DEEPGRAM_ENABLED = TRANSCRIBE_MODE == "deepgram" and bool(DEEPGRAM_KEY)
 
 
 SPEAKER_NAMES = {}          # deepgram index -> name the user typed
@@ -238,6 +195,13 @@ def post_json(url, headers, payload, timeout):
     """
     import urllib.error
     import urllib.request
+
+    from urllib.parse import urlparse
+    u = urlparse(url)
+    local = u.hostname in ("localhost", "127.0.0.1", "::1")
+    if u.scheme != "https" and not (u.scheme == "http" and local):
+        raise ValueError(f"refusing to send credentials to non-HTTPS URL: "
+                         f"{u.scheme}://{u.hostname}")
 
     body = json.dumps(payload).encode()
     head = dict(headers)
@@ -454,6 +418,10 @@ def write_transcript(path, data):
             f.write(f"# Meeting {data.get('started', '')}\n\n")
             f.write(f"*{data.get('source', '')} → {data.get('target', '')}"
                     f" · {data.get('engine', '')}*\n\n")
+            if isinstance(data.get("summary"), dict):
+                f.write("## Summary\n\n" + summary_text(data["summary"])
+                        .replace("  [ ] ", "- [ ] ").replace("  - ", "- ")
+                        + "\n\n## Transcript\n\n")
             for item in lines:
                 f.write(f"**{item.get('stamp', '')}** {who(item)}"
                         f"{item.get('text', '')}\n\n")
@@ -462,6 +430,9 @@ def write_transcript(path, data):
         else:
             f.write(f"Meeting {data.get('started', '')}  "
                     f"({data.get('source', '')} -> {data.get('target', '')})\n\n")
+            if isinstance(data.get("summary"), dict):
+                f.write("SUMMARY\n" + summary_text(data["summary"])
+                        + "\n\n" + "-" * 60 + "\n\n")
             for item in lines:
                 f.write(f"[{item.get('stamp', '')}] {who(item)}"
                         f"{item.get('text', '')}\n")
@@ -498,7 +469,7 @@ def log(*a):
 def transcribe_summary(local=None):
     """What is turning speech into text (pass the window's live state)."""
     if local is None:
-        local = not DEEPGRAM_ENABLED
+        local = TRANSCRIBE_MODE == "local"
     if not local:
         return "Deepgram · cloud"
     name = os.path.basename(active_model_dir()).replace("-ct2", "")
@@ -510,10 +481,6 @@ def translate_summary():
     live = active_providers()
     if live:
         return f"{live[0]['model']} · cloud"
-    if USE_GEMINI:
-        return f"{GEMINI_ACTIVE} · cloud"
-    if USE_OPENAI:
-        return f"{TRANSLATE_MODEL} · cloud"
     return "off"
 
 
@@ -522,9 +489,8 @@ def engine_summary():
 
 
 PROVIDERS = load_providers()
-HAVE_TRANSLATION = bool(active_providers())
 
-log("config: transcribe =", TRANSCRIBE_MODE, "| translate =", TRANSLATE_MODE)
+log("config: transcribe =", TRANSCRIBE_MODE)
 log(f"config: {len(active_providers())} translation provider(s) enabled")
 log("config:", engine_summary())
 log(f"config: {len(KEYTERM_PROMPT.split(',')) if KEYTERM_PROMPT else 0} keyterms loaded")
@@ -667,7 +633,7 @@ class LocalListener(QThread):
 
     # -- capture: runs in its own thread so the GPU never stalls it --
 
-    def capture(self):
+    def capture_loop(self):
         import numpy as np
 
         cap = audio_backend.Capture(
@@ -728,7 +694,7 @@ class LocalListener(QThread):
             self.status.emit(f"Error: {e}")
             return
 
-        reader = threading.Thread(target=self.capture, daemon=True)
+        reader = threading.Thread(target=self.capture_loop, daemon=True)
         reader.start()
         self.status.emit("LIVE (local)")
 
@@ -792,7 +758,7 @@ class Translator(QThread):
 
     def run(self):
         log(f"translate: batch of {len(self.texts)} lines -> {self.target} "
-            f"({sum(len(t) for t in self.texts)} chars) mode={TRANSLATE_MODE}")
+            f"({sum(len(t) for t in self.texts)} chars)")
         if not active_providers():
             self.failed.emit(self.job_ids,
                              "no translation provider - add one in API Keys")
@@ -831,7 +797,7 @@ class Translator(QThread):
                f"{p['model']}:generateContent")
         log(f"  -> {p['name']} ({p['model']})")
         status, text = post_json(
-            url, {"x-goog-api-key": p["key"]}, self.payload(), GEMINI_TIMEOUT)
+            url, {"x-goog-api-key": p["key"]}, self.payload(), REQUEST_TIMEOUT)
         if status != 200:
             raise RuntimeError(f"HTTP {status}: {text[:150]}")
         raw = json.loads(text)["candidates"][0]["content"]["parts"][0]["text"]
@@ -882,7 +848,7 @@ class Translator(QThread):
                   f"Translate each numbered line into {self.target}. "
                   'Reply as {"lines": [...]} - one string per input line.'},
                  {"role": "user", "content": numbered}]},
-            GEMINI_TIMEOUT)
+            REQUEST_TIMEOUT)
         if status != 200:
             raise RuntimeError(f"HTTP {status}: {text[:150]}")
         data = json.loads(json.loads(text)["choices"][0]["message"]["content"])
@@ -905,89 +871,6 @@ class Translator(QThread):
             "generationConfig": {"temperature": 0,
                                  "responseMimeType": "application/json"},
         }
-
-    def via_openai(self):
-        numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(self.texts))
-        status, text = post_json(
-            f"{TRANSLATE_BASE}/chat/completions",
-            {"Authorization": f"Bearer {TRANSLATE_KEY}"},
-            {"model": TRANSLATE_MODEL, "temperature": 0,
-                  "response_format": {"type": "json_object"},
-                  "messages": [
-                      {"role": "system", "content":
-                       f"Translate each numbered line into {self.target}. "
-                       'Reply as {"lines": [...]} - one string per input line.'},
-                      {"role": "user", "content": numbered}]},
-            GEMINI_TIMEOUT)
-        if status >= 400:
-            raise RuntimeError(f"HTTP {status}: {text[:200]}")
-        data = json.loads(json.loads(text)["choices"][0]["message"]["content"])
-        return data["lines"] if isinstance(data, dict) else data
-
-    def via_gemini(self):
-        """Google's own REST shape - not OpenAI-compatible.
-
-        Tries the preferred model first; on a transient failure (overloaded,
-        rate limited) it moves to the next model in the chain rather than
-        hammering one that is clearly busy.
-        """
-        import time
-        global GEMINI_ACTIVE
-
-        payload = self.payload()
-
-        # free-tier models first, then the paid key if one is configured
-        free = [GEMINI_ACTIVE] + [m for m in [GEMINI_MODEL] + GEMINI_FALLBACKS
-                                  if m != GEMINI_ACTIVE]
-        chain = [(m, GEMINI_KEY, False) for m in free]
-        if PAID_API_KEY:
-            chain.append((PAID_MODEL, PAID_API_KEY, True))
-        problems = []
-
-        for model, key, paid in chain:
-            for attempt in range(2):          # brief retry before moving on
-                try:
-                    log(f"  -> POST {model}{' [PAID KEY]' if paid else ''} "
-                        f"(try {attempt + 1}, timeout {GEMINI_TIMEOUT}s)")
-                    status, text = post_json(
-                        "https://generativelanguage.googleapis.com/v1beta/"
-                        f"models/{model}:generateContent",
-                        {"x-goog-api-key": key}, payload, GEMINI_TIMEOUT)
-                    log(f"  <- {model}: HTTP {status}")
-                except Exception as e:
-                    log(f"  <- {model}: {type(e).__name__}: {e}")
-                    problems.append(f"{model}: {type(e).__name__}")
-                    break
-
-                if status in (429, 500, 502, 503, 504):
-                    if status == 429:
-                        log(f"  !! {model} rate limited (429)")
-                    if attempt == 0:
-                        time.sleep(1.2)
-                        continue
-                    problems.append(f"{model}: {status}")
-                    self.status.emit(f"{model} busy - trying next model...")
-                    break
-
-                if status >= 400:             # real error, chain won't help
-                    log(f"  !! {model} hard error: {text[:300]}")
-                    raise RuntimeError(f"HTTP {status}: {text[:200]}")
-
-                if paid:
-                    self.status.emit(f"using paid key · {model}")
-                elif model != GEMINI_ACTIVE:
-                    GEMINI_ACTIVE = model     # stick with what works
-                    self.status.emit(f"Switched to {model}")
-                raw = json.loads(text)["candidates"][0]["content"]["parts"][0]["text"]
-                out = json.loads(raw)
-                if isinstance(out, dict):     # some models wrap it
-                    out = next(v for v in out.values() if isinstance(v, list))
-                return [str(x).strip() for x in out]
-
-        tail = ("" if PAID_API_KEY else
-                " (set PAID_API_KEY in .env to add a billed fallback)")
-        raise RuntimeError("all models unavailable - " + "; ".join(problems) + tail)
-
 
 # ---- ui pieces ---------------------------------------------------------
 
@@ -1258,6 +1141,13 @@ class ProviderDialog(QDialog):
             return
         if not (p["base"] and p["model"]):
             self.status.setText("endpoint and model are required")
+            return
+        from urllib.parse import urlparse
+        u = urlparse(p["base"])
+        if u.scheme != "https" and u.hostname not in (
+                "localhost", "127.0.0.1", "::1"):
+            self.status.setText("the endpoint must start with https:// - "
+                                "otherwise your key would travel unencrypted")
             return
         self.provider = p
         self.accept()
@@ -1953,80 +1843,240 @@ class ModelManager(QDialog):
         self.reload()
 
 
-class Replier(QThread):
-    """Asks the model what to say next, given the recent conversation."""
+# ---- talking to the LLM (shared by reply, summary and questions) -------
+
+# 2 hours of meeting is roughly 120k characters; flash-lite takes far more,
+# but we cap it so a runaway session cannot produce a huge bill
+MAX_CONTEXT_CHARS = int(ENV.get("MAX_CONTEXT_CHARS", "300000"))
+SUMMARY_MIN_LINES = int(ENV.get("SUMMARY_MIN_LINES", "5"))
+AUTO_SUMMARY = ENV.get("AUTO_SUMMARY", "1") != "0"
+
+
+def ask_llm(system, user, temperature=0.3, max_tokens=1200, json_mode=False):
+    """Send one prompt to the first provider that answers.
+
+    Returns (text, provider_name). Raises if no provider works.
+    """
+    problems = []
+    for p in active_providers():
+        try:
+            if p["kind"] == "gemini":
+                cfg = {"temperature": temperature, "maxOutputTokens": max_tokens}
+                if json_mode:
+                    cfg["responseMimeType"] = "application/json"
+                status, text = post_json(
+                    f"{p['base'].rstrip('/')}/models/{p['model']}:generateContent",
+                    {"x-goog-api-key": p["key"]},
+                    {"systemInstruction": {"parts": [{"text": system}]},
+                     "contents": [{"parts": [{"text": user}]}],
+                     "generationConfig": cfg},
+                    REQUEST_TIMEOUT)
+                if status != 200:
+                    raise RuntimeError(f"HTTP {status}: {text[:120]}")
+                out = json.loads(text)["candidates"][0]["content"]["parts"][0]["text"]
+            else:
+                body = {"model": p["model"], "temperature": temperature,
+                        "max_tokens": max_tokens,
+                        "messages": [{"role": "system", "content": system},
+                                     {"role": "user", "content": user}]}
+                if json_mode:
+                    body["response_format"] = {"type": "json_object"}
+                status, text = post_json(
+                    f"{p['base'].rstrip('/')}/chat/completions",
+                    {"Authorization": f"Bearer {p['key']}"}, body,
+                    REQUEST_TIMEOUT)
+                if status != 200:
+                    raise RuntimeError(f"HTTP {status}: {text[:120]}")
+                out = json.loads(text)["choices"][0]["message"]["content"]
+            return out.strip(), p["name"]
+        except Exception as e:
+            log(f"  llm: {p['name']} failed: {type(e).__name__}: {e}")
+            problems.append(f"{p['name']}: {type(e).__name__}")
+    if not problems:
+        raise RuntimeError("no LLM provider - add one under API Keys")
+    raise RuntimeError("no provider answered - " + "; ".join(problems))
+
+
+def transcript_text(lines, limit=MAX_CONTEXT_CHARS):
+    """Session lines -> plain text the model can read.
+
+    `lines` are dicts with stamp / text / speaker. Engine-switch dividers are
+    dropped. If the meeting is longer than `limit`, the start is trimmed and
+    the model is told so.
+    """
+    rows = []
+    for item in lines:
+        text = str(item.get("text", "")).strip()
+        if not text or text.startswith("—"):
+            continue
+        spk = item.get("speaker")
+        who = f"{speaker_name(spk)}: " if isinstance(spk, int) else ""
+        stamp = item.get("stamp", "")
+        rows.append(f"[{stamp}] {who}{text}" if stamp else f"{who}{text}")
+    out = "\n".join(rows)
+    if len(out) > limit:
+        out = "[earlier part of the meeting omitted]\n" + out[-limit:]
+    return out
+
+
+def parse_summary(raw):
+    """Model reply -> summary dict. Tolerates code fences and stray keys."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        text = text[text.find("{"):]
+    try:
+        data = json.loads(text[text.find("{"):text.rfind("}") + 1])
+    except Exception:
+        return {"summary": raw.strip(), "decisions": [], "action_items": [],
+                "open_questions": []}
+
+    def strings(v):
+        return [str(x).strip() for x in v if str(x).strip()] \
+            if isinstance(v, list) else []
+
+    items = []
+    for it in data.get("action_items") or []:
+        if isinstance(it, dict) and str(it.get("task", "")).strip():
+            items.append({k: str(it.get(k, "") or "").strip()
+                          for k in ("task", "owner", "due")})
+        elif isinstance(it, str) and it.strip():
+            items.append({"task": it.strip(), "owner": "", "due": ""})
+    return {
+        "summary": str(data.get("summary", "")).strip(),
+        "decisions": strings(data.get("decisions")),
+        "action_items": items,
+        "open_questions": strings(data.get("open_questions")),
+    }
+
+
+def summary_text(s):
+    """Plain-text version - for copy and for .txt / .md export."""
+    if not s:
+        return ""
+    out = [s.get("summary", "")]
+    if s.get("decisions"):
+        out += ["", "Decisions:"] + [f"  - {d}" for d in s["decisions"]]
+    if s.get("action_items"):
+        out += ["", "Action items:"]
+        for it in s["action_items"]:
+            extra = " · ".join(x for x in (it.get("owner"), it.get("due")) if x)
+            out.append(f"  [ ] {it['task']}" + (f"  ({extra})" if extra else ""))
+    if s.get("open_questions"):
+        out += ["", "Open questions:"] + [f"  - {q}" for q in s["open_questions"]]
+    return "\n".join(out).strip()
+
+
+def summary_html(s):
+    import html
+    e = html.escape
+    if not s:
+        return ""
+    parts = [f"<p style='margin:0 0 8px 0;line-height:140%'>{e(s.get('summary', ''))}</p>"]
+
+    def block(title, rows):
+        if rows:
+            parts.append(f"<p style='margin:8px 0 3px 0;color:{MUTED};"
+                         f"font-size:10px;font-weight:700'>{title}</p>")
+            parts.append("".join(f"<div style='margin:0 0 3px 0'>{r}</div>"
+                                 for r in rows))
+
+    block("DECISIONS", [f"✓ {e(d)}" for d in s.get("decisions", [])])
+    acts = []
+    for it in s.get("action_items", []):
+        extra = " · ".join(e(x) for x in (it.get("owner"), it.get("due")) if x)
+        acts.append(f"☐ {e(it['task'])}"
+                    + (f" <span style='color:{MUTED}'>— {extra}</span>"
+                       if extra else ""))
+    block("ACTION ITEMS", acts)
+    block("OPEN QUESTIONS", [f"? {e(q)}" for q in s.get("open_questions", [])])
+    return "".join(parts)
+
+
+class LLMTask(QThread):
+    """Runs one ask_llm call off the UI thread."""
 
     done = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, lines, language, level):
+    def __init__(self, label, system, user, temperature=0.3, max_tokens=1200,
+                 json_mode=False):
         super().__init__()
-        self.lines = lines
-        self.language = language
-        self.level = level
+        self.label = label
+        self.system = system
+        self.user = user
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.json_mode = json_mode
 
     def run(self):
-        log(f"reply: drafting from last {len(self.lines)} lines")
-        if not active_providers():
-            self.failed.emit("no translation provider - add one in API Keys")
-            return
-        convo = "\n".join(self.lines)
-        payload = {
-            "systemInstruction": {"parts": [{"text":
-                "You are already in this conversation. Say the next thing.\n\n"
-                f"Talk like a normal person in {self.language} - the way people "
-                "actually speak out loud, not the way they write. Around 30 to "
-                "60 seconds of talking.\n\n"
-                f"LANGUAGE LEVEL - this matters most: {self.level}\n"
-                "Keep every sentence easy to follow. If a simpler word exists, "
-                "use it.\n\n"
-                "Sound human:\n"
-                "- Use everyday words. Short sentences. Contractions.\n"
-                "- Start naturally, the way people really do - \"yeah\", "
-                "\"okay so\", \"right\", \"hmm\", \"got it\".\n"
-                "- React first, like a person would, then say your bit.\n"
-                "- One simple idea is enough. Don't cram in three points.\n"
-                "- It's fine to be casual, to trail off, to think out loud.\n\n"
-                "Avoid completely: corporate words like leverage, align, "
-                "circle back, deep dive, moving forward, synergy, "
-                "double down, key takeaway, drive impact. No lists. No "
-                "summarising what was just said back at them. Don't sound "
-                "like an email or a consultant.\n\n"
-                "Just the words to say - nothing else."}]},
-            "contents": [{"parts": [{"text":
-                f"{convo}\n\nWhat do I say?"}]}],
-            "generationConfig": {"temperature": 0.9, "maxOutputTokens": 400},
-        }
-        for p in active_providers():
-            try:
-                if p["kind"] == "gemini":
-                    status, text = post_json(
-                        f"{p['base'].rstrip('/')}/models/"
-                        f"{p['model']}:generateContent",
-                        {"x-goog-api-key": p["key"]}, payload, GEMINI_TIMEOUT)
-                    if status != 200:
-                        raise RuntimeError(f"HTTP {status}")
-                    out = json.loads(text)["candidates"][0]["content"]["parts"][0]["text"]
-                else:
-                    sys_txt = payload["systemInstruction"]["parts"][0]["text"]
-                    usr_txt = payload["contents"][0]["parts"][0]["text"]
-                    status, text = post_json(
-                        f"{p['base'].rstrip('/')}/chat/completions",
-                        {"Authorization": f"Bearer {p['key']}"},
-                        {"model": p["model"], "temperature": 0.9,
-                         "max_tokens": 400,
-                         "messages": [{"role": "system", "content": sys_txt},
-                                      {"role": "user", "content": usr_txt}]},
-                        GEMINI_TIMEOUT)
-                    if status != 200:
-                        raise RuntimeError(f"HTTP {status}")
-                    out = json.loads(text)["choices"][0]["message"]["content"]
-                log(f"reply: drafted via {p['name']}")
-                self.done.emit(out.strip())
-                return
-            except Exception as e:
-                log(f"  reply: {p['name']} failed: {type(e).__name__}: {e}")
-        self.failed.emit("no provider answered - check API Keys")
+        log(f"{self.label}: sending {len(self.user)} chars")
+        try:
+            out, who = ask_llm(self.system, self.user, self.temperature,
+                               self.max_tokens, self.json_mode)
+            log(f"{self.label}: answered by {who}")
+            self.done.emit(out)
+        except Exception as e:
+            log(f"{self.label}: failed: {e}")
+            self.failed.emit(str(e)[:160])
+
+
+REPLY_PROMPT = (
+    "You are already in this conversation. Say the next thing.\n\n"
+    "Talk like a normal person in {language} - the way people actually speak "
+    "out loud, not the way they write. Around 30 to 60 seconds of talking.\n\n"
+    "LANGUAGE LEVEL - this matters most: {level}\n"
+    "Keep every sentence easy to follow. If a simpler word exists, use it.\n\n"
+    "Sound human:\n"
+    "- Use everyday words. Short sentences. Contractions.\n"
+    "- Start naturally, the way people really do - \"yeah\", \"okay so\", "
+    "\"right\", \"hmm\", \"got it\".\n"
+    "- React first, like a person would, then say your bit.\n"
+    "- One simple idea is enough. Don't cram in three points.\n"
+    "- It's fine to be casual, to trail off, to think out loud.\n\n"
+    "Avoid completely: corporate words like leverage, align, circle back, deep "
+    "dive, moving forward, synergy, double down, key takeaway, drive impact. "
+    "No lists. No summarising what was just said back at them. Don't sound "
+    "like an email or a consultant.\n\n"
+    "Just the words to say - nothing else."
+)
+
+SUMMARY_PROMPT = (
+    "You summarise meetings from an automatic transcript. Write everything in "
+    "{language}.\n\n"
+    "Return a JSON object with exactly these keys:\n"
+    '  "summary":        3 to 6 plain sentences on what the meeting covered\n'
+    '  "decisions":      list of strings - things that were agreed\n'
+    '  "action_items":   list of objects {{"task": "", "owner": "", "due": ""}}\n'
+    '  "open_questions": list of strings - raised but not settled\n\n'
+    "Rules:\n"
+    "- Only include what is actually in the transcript. Never invent.\n"
+    "- Leave owner or due as \"\" unless the transcript states them.\n"
+    "- Use empty lists when there is nothing to report.\n"
+    "- The transcript comes from speech recognition and may contain "
+    "misheard words; read past obvious errors."
+)
+
+ASK_PROMPT = (
+    "You answer questions about a meeting, using only its transcript.\n\n"
+    "- Reply in the same language the question is written in.\n"
+    "- Be brief: one to four sentences.\n"
+    "- If the transcript does not cover it, say so plainly - do not guess.\n"
+    "- When it helps, say when it came up [hh:mm] and who said it.\n"
+    "- The transcript comes from speech recognition and may contain "
+    "misheard words."
+)
+
+
+class Replier(LLMTask):
+    """'What should I say?' - drafts the next thing to say."""
+
+    def __init__(self, lines, language, level):
+        super().__init__(
+            "reply",
+            REPLY_PROMPT.format(language=language, level=level),
+            "\n".join(lines) + "\n\nWhat do I say?",
+            temperature=0.9, max_tokens=400)
 
 
 class LineCard(QFrame):
@@ -2104,6 +2154,7 @@ class LineCard(QFrame):
         box.addLayout(head)
 
         self.body = QLabel(text)
+        self.body.setTextFormat(Qt.PlainText)   # transcript text, never HTML
         self.body.setWordWrap(True)
         self.body.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.body.setStyleSheet(
@@ -2111,6 +2162,7 @@ class LineCard(QFrame):
         box.addWidget(self.body)
 
         self.out = QLabel("")
+        self.out.setTextFormat(Qt.PlainText)    # model output, never HTML
         self.out.setWordWrap(True)
         self.out.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.out.setStyleSheet(
@@ -2132,6 +2184,16 @@ class LineCard(QFrame):
     def leaveEvent(self, e):
         self.hovered = False
         self.tools_fade.setOpacity(0.0)
+        self.paint()
+
+    def flash(self, ms=2200):
+        """Briefly highlight - used when jumping here from a search."""
+        self.flashing = True
+        self.paint()
+        QTimer.singleShot(ms, self.unflash)
+
+    def unflash(self):
+        self.flashing = False
         self.paint()
 
     def copy_out(self):
@@ -2174,10 +2236,14 @@ class LineCard(QFrame):
         # the left stripe identifies the speaker; the outline shows progress
         stripe = (SPEAKER_COLORS[self.speaker % len(SPEAKER_COLORS)]
                   if self.speaker is not None else edge)
-        bg = "#fbfaff" if self.hovered else "#ffffff"
+        bg = ("#fff6cc" if getattr(self, "flashing", False)
+              else "#fbfaff" if self.hovered else "#ffffff")
+        # children must be see-through, or the window-wide white background
+        # paints boxes behind every label when the card is tinted
         self.setStyleSheet(
             f"#card{{background:{bg};border:1px solid {edge};"
-            f"border-left:3px solid {stripe};border-radius:10px;}}")
+            f"border-left:3px solid {stripe};border-radius:10px;}}"
+            "#card QLabel, #card QWidget{background:transparent;}")
 
 
 class Card(QFrame):
@@ -2218,6 +2284,7 @@ class Card(QFrame):
             outer.addLayout(head)
 
         self.body = QLabel(text)
+        self.body.setTextFormat(Qt.PlainText)   # transcript text, never HTML
         self.body.setWordWrap(True)
         self.body.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.body.setStyleSheet(
@@ -2362,10 +2429,12 @@ class Window(QWidget):
         self.session_started = datetime.now().strftime("%Y-%m-%d %H:%M")
         self.speakers_seen = set()
         self.mic_on = CAPTURE_MIC
+        self.summary = None        # dict from parse_summary, saved with session
+        self.summary_lines = 0     # how many lines that summary covered
         # translate through the cloud API when we have a key; the local 9B
         # does not fit next to whisper on an 8GB card
 
-        self.setWindowTitle("LinguistLive")
+        self.setWindowTitle("MeetingScribe")
         self.resize(1240, 800)
         self.setStyleSheet(f"background:{BG};")
 
@@ -2454,7 +2523,7 @@ class Window(QWidget):
 
         top = QHBoxLayout()
         top.setContentsMargins(14, 0, 8, 0)
-        brand = QLabel("LinguistLive")
+        brand = QLabel("MeetingScribe")
         brand.setStyleSheet(f"color:{TEXT};font-size:15px;font-weight:700;")
         top.addWidget(brand)
         top.addStretch()
@@ -2529,7 +2598,7 @@ class Window(QWidget):
     def show_history(self):
         self.paint_nav("History")
         self.pages.setCurrentIndex(1)
-        self.load_history()
+        self.load_history(self.history_search.text())
 
     def build_topbar(self):
         bar = QWidget()
@@ -2722,6 +2791,7 @@ class Window(QWidget):
         rb.addLayout(cap)
 
         self.reply_text = QLabel("")
+        self.reply_text.setTextFormat(Qt.PlainText)
         self.reply_text.setWordWrap(True)
         self.reply_text.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.reply_text.setStyleSheet(
@@ -2732,11 +2802,123 @@ class Window(QWidget):
 
         self.reply_box.setVisible(False)
         pv.addWidget(self.reply_box)
+
+        # --- meeting: summary + questions ---------------------------------
+        pv.addSpacing(10)
+        pv.addWidget(self.section_label("MEETING"))
+
+        self.summary_btn = self.rail_button("📝  Summarize meeting",
+                                            self.summarize, False)
+        pv.addWidget(self.summary_btn)
+
+        self.summary_box, self.summary_title, self.summary_text = \
+            self.result_card("SUMMARY", lambda: self.summary_plain())
+        pv.addWidget(self.summary_box)
+
+        from PySide6.QtWidgets import QLineEdit
+        ask_row = QHBoxLayout()
+        ask_row.setSpacing(6)
+        self.ask_edit = QLineEdit()
+        self.ask_edit.setPlaceholderText("Ask about this meeting…")
+        self.ask_edit.setFixedHeight(32)
+        self.ask_edit.setStyleSheet(
+            f"QLineEdit{{background:#fff;border:1px solid {BORDER};"
+            f"border-radius:8px;padding:2px 10px;font-size:12px;color:{TEXT};}}"
+            f"QLineEdit:focus{{border-color:{ACCENT};}}")
+        self.ask_edit.returnPressed.connect(self.ask_question)
+        ask_row.addWidget(self.ask_edit, 1)
+        self.ask_btn = QPushButton("Ask")
+        self.ask_btn.setCursor(Qt.PointingHandCursor)
+        self.ask_btn.setFixedSize(52, 32)
+        self.ask_btn.clicked.connect(self.ask_question)
+        self.ask_btn.setStyleSheet(
+            f"QPushButton{{background:{ACCENT};color:#fff;border:none;"
+            "border-radius:8px;font-size:12px;font-weight:600;}"
+            "QPushButton:hover{background:#5b3fd4;}"
+            "QPushButton:disabled{background:#c9c4e0;}")
+        ask_row.addWidget(self.ask_btn)
+        pv.addLayout(ask_row)
+
+        self.answer_box, self.answer_title, self.answer_text = \
+            self.result_card("ANSWER", lambda: self.answer_text.text())
+        pv.addWidget(self.answer_box)
+
         pv.addStretch()
-        rv.addWidget(pad, 1)
+
+        # the rail grows with summary + answer; let it scroll on small screens
+        rail = QScrollArea()
+        rail.setWidgetResizable(True)
+        rail.setFrameShape(QFrame.NoFrame)
+        rail.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        rail.setStyleSheet(f"QScrollArea{{background:{PANEL_BG};}}")
+        rail.setWidget(pad)
+        rv.addWidget(rail, 1)
 
         row.addWidget(right, 1)
         return holder
+
+    def section_label(self, text):
+        lab = QLabel(text)
+        lab.setStyleSheet(
+            f"color:{MUTED};font-size:10px;font-weight:700;letter-spacing:1px;")
+        return lab
+
+    def rail_button(self, text, slot, primary):
+        b = QPushButton(text)
+        b.setCursor(Qt.PointingHandCursor)
+        b.setFixedHeight(34)
+        b.clicked.connect(lambda: slot())
+        b.setStyleSheet(
+            (f"QPushButton{{background:{ACCENT};color:#fff;border:none;"
+             if primary else
+             f"QPushButton{{background:#fff;color:{TEXT};"
+             f"border:1px solid {BORDER};")
+            + "border-radius:8px;font-size:12px;font-weight:600;}"
+            + (f"QPushButton:hover{{background:#5b3fd4;}}" if primary else
+               f"QPushButton:hover{{border-color:{ACCENT};color:{ACCENT};}}")
+            + "QPushButton:disabled{background:#eceaf5;color:#b0aac6;"
+              "border-color:#e5e2f0;}")
+        return b
+
+    def result_card(self, title, copy_text):
+        """A titled card with a copy button. Hidden until it has content."""
+        box = QFrame()
+        box.setObjectName("card")
+        box.setStyleSheet(
+            f"#card{{background:#fff;border:1px solid {BORDER};"
+            f"border-left:3px solid {ACCENT};border-radius:10px;}}")
+        col = QVBoxLayout(box)
+        col.setContentsMargins(12, 10, 12, 11)
+        col.setSpacing(6)
+
+        top = QHBoxLayout()
+        head = QLabel(title)
+        head.setStyleSheet(
+            f"color:{MUTED};font-size:10px;font-weight:700;letter-spacing:1px;")
+        top.addWidget(head)
+        top.addStretch()
+        copy = QPushButton("⧉")
+        copy.setCursor(Qt.PointingHandCursor)
+        copy.setFixedSize(20, 20)
+        copy.setToolTip("Copy")
+        copy.setStyleSheet(
+            f"QPushButton{{border:none;background:transparent;color:{MUTED};}}"
+            f"QPushButton:hover{{color:{ACCENT};}}")
+        copy.clicked.connect(
+            lambda: QApplication.clipboard().setText(copy_text() or ""))
+        top.addWidget(copy)
+        col.addLayout(top)
+
+        body = QLabel("")
+        body.setWordWrap(True)
+        body.setTextFormat(Qt.RichText)
+        body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        body.setAlignment(Qt.AlignTop)
+        body.setStyleSheet(f"color:{TEXT};font-size:12px;")
+        col.addWidget(body)
+
+        box.setVisible(False)
+        return box, head, body
 
     def session_payload(self):
         return {
@@ -2746,6 +2928,8 @@ class Window(QWidget):
             "source": self.source.lang_name(),
             "target": self.target.lang_name(),
             "speakers": {str(k): v for k, v in SPEAKER_NAMES.items()},
+            "summary": self.summary,
+            "summary_lines": self.summary_lines,
             "lines": [{"stamp": c.when.text(), "text": c.text,
                        "translation": c.translation,
                        "speaker": c.speaker} for c in self.cards],
@@ -2754,7 +2938,7 @@ class Window(QWidget):
     def autosave(self):
         if not self.cards:
             return
-        os.makedirs(SESSION_DIR, exist_ok=True)
+        os.makedirs(SESSION_DIR, mode=0o700, exist_ok=True)
         if self.session_file is None:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             self.session_file = os.path.join(SESSION_DIR, f"session-{stamp}.json")
@@ -2801,7 +2985,7 @@ class Window(QWidget):
             return
         from PySide6.QtWidgets import QFileDialog
 
-        os.makedirs(SESSION_DIR, exist_ok=True)
+        os.makedirs(SESSION_DIR, mode=0o700, exist_ok=True)
         default = os.path.join(
             SESSION_DIR, datetime.now().strftime("transcript-%Y%m%d-%H%M.txt"))
         path, _ = QFileDialog.getSaveFileName(
@@ -2830,7 +3014,28 @@ class Window(QWidget):
         t.setStyleSheet(
             f"color:{MUTED};font-size:11px;font-weight:700;letter-spacing:1px;")
         h.addWidget(t)
-        h.addStretch()
+        h.addSpacing(12)
+
+        from PySide6.QtWidgets import QLineEdit
+        self.history_search = QLineEdit()
+        self.history_search.setPlaceholderText(
+            "🔍  Search every meeting — words, names, translations, summaries")
+        self.history_search.setClearButtonEnabled(True)
+        self.history_search.setFixedHeight(28)
+        self.history_search.setStyleSheet(
+            f"QLineEdit{{background:#fff;border:1px solid {BORDER};"
+            f"border-radius:7px;padding:2px 10px;font-size:11px;color:{TEXT};}}"
+            f"QLineEdit:focus{{border-color:{ACCENT};}}")
+        h.addWidget(self.history_search, 1)
+        # wait for a pause in typing rather than re-reading files every key
+        self.search_timer = QTimer(self)
+        self.search_timer.setSingleShot(True)
+        self.search_timer.timeout.connect(
+            lambda: self.load_history(self.history_search.text()))
+        self.history_search.textChanged.connect(
+            lambda _t: self.search_timer.start(250))
+        h.addSpacing(8)
+
         folder = QPushButton("Open folder")
         folder.setCursor(Qt.PointingHandCursor)
         folder.setFixedHeight(26)
@@ -2838,8 +3043,7 @@ class Window(QWidget):
             f"QPushButton{{background:#fff;border:1px solid {BORDER};"
             f"border-radius:6px;padding:0 10px;font-size:11px;color:{TEXT};}}"
             f"QPushButton:hover{{border-color:{ACCENT};color:{ACCENT};}}")
-        folder.clicked.connect(
-            lambda: subprocess.Popen(["xdg-open", SESSION_DIR]))
+        folder.clicked.connect(self.open_sessions_folder)
         h.addWidget(folder)
         v.addWidget(bar)
 
@@ -2863,13 +3067,70 @@ class Window(QWidget):
         v.addWidget(wrap)
         return page
 
-    def load_history(self):
+    def open_sessions_folder(self):
+        os.makedirs(SESSION_DIR, mode=0o700, exist_ok=True)
+        try:
+            if platform.system() == "Windows":
+                os.startfile(SESSION_DIR)          # noqa - Windows only
+            else:
+                subprocess.Popen(["xdg-open", SESSION_DIR])
+        except Exception as e:
+            self.status_msg(f"could not open folder: {e}")
+
+    def read_session(self, path):
+        """Parsed session, cached by modification time."""
+        cache = self.__dict__.setdefault("_session_cache", {})
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return None
+        hit = cache.get(path)
+        if hit and hit[0] == mtime:
+            return hit[1]
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return None
+        except Exception:
+            return None
+        cache[path] = (mtime, data)
+        return data
+
+    def search_session(self, data, query):
+        """(match count, first matching snippet) for one session."""
+        q = query.lower()
+        hits, first = 0, None
+        for item in data.get("lines") or []:
+            if not isinstance(item, dict):
+                continue
+            for field in ("text", "translation"):
+                value = str(item.get(field, "") or "")
+                n = value.lower().count(q)
+                if n:
+                    hits += n
+                    if first is None:
+                        first = (str(item.get("stamp", "")), value)
+        summ = summary_text(data.get("summary")) \
+            if isinstance(data.get("summary"), dict) else ""
+        n = summ.lower().count(q)
+        if n:
+            hits += n
+            if first is None:
+                first = ("summary", next(l for l in summ.splitlines()
+                                         if q in l.lower()).strip())
+        if q in str(data.get("started", "")).lower():
+            hits = max(hits, 1)
+        return hits, first
+
+    def load_history(self, query=""):
         while self.history_list.count() > 1:
             w = self.history_list.takeAt(0).widget()
             if w:
                 w.setParent(None)
 
-        os.makedirs(SESSION_DIR, exist_ok=True)
+        query = (query or "").strip()
+        os.makedirs(SESSION_DIR, mode=0o700, exist_ok=True)
         files = sorted((f for f in os.listdir(SESSION_DIR) if f.endswith(".json")),
                        reverse=True)
         if not files:
@@ -2877,21 +3138,42 @@ class Window(QWidget):
                            "automatically while you record.")
             empty.setStyleSheet(f"color:{MUTED};font-size:12px;")
             self.history_list.insertWidget(0, empty)
+            self.history_status.setText("")
             return
 
+        shown = total_hits = 0
         for name in files:
             path = os.path.join(SESSION_DIR, name)
-            try:
-                with open(path) as f:
-                    data = json.load(f)
-                if not isinstance(data, dict):
-                    continue
-            except Exception:
+            data = self.read_session(path)
+            if data is None:
                 continue
+            match = None
+            if query:
+                hits, first = self.search_session(data, query)
+                if not hits:
+                    continue
+                match = (query, hits, first)
+                total_hits += hits
+            shown += 1
             self.history_list.insertWidget(
-                self.history_list.count() - 1, self.history_row(path, data))
+                self.history_list.count() - 1,
+                self.history_row(path, data, match))
 
-    def history_row(self, path, data):
+        if query:
+            if shown:
+                self.history_status.setText(
+                    f"“{query}” — {total_hits} match{'es' * (total_hits != 1)} "
+                    f"in {shown} meeting{'s' * (shown != 1)}")
+            else:
+                none = QLabel(f"Nothing found for “{query}”.")
+                none.setStyleSheet(f"color:{MUTED};font-size:12px;")
+                self.history_list.insertWidget(0, none)
+                self.history_status.setText("")
+        else:
+            self.history_status.setText(
+                f"{shown} saved meeting{'s' * (shown != 1)}")
+
+    def history_row(self, path, data, match=None):
         row = QFrame()
         row.setObjectName("card")
         row.setStyleSheet(
@@ -2905,16 +3187,49 @@ class Window(QWidget):
         left = QVBoxLayout()
         title = QLabel(f"{data.get('started', '?')}   ·   "
                        f"{os.path.basename(path).replace('session-', '')[:-5]}")
+        title.setTextFormat(Qt.PlainText)
         title.setStyleSheet(f"color:{TEXT};font-size:12px;font-weight:600;")
         left.addWidget(title)
+        has_summary = isinstance(data.get("summary"), dict)
         sub = QLabel(f"{len(lines)} lines · {done} translated · "
-                     f"{data.get('target', '')}")
+                     f"{data.get('target', '')}"
+                     + ("  ·  📝 summary" if has_summary else ""))
         sub.setStyleSheet(f"color:{MUTED};font-size:11px;")
         left.addWidget(sub)
-        h.addLayout(left)
-        h.addStretch()
 
-        for label, slot in (("Open", lambda: self.open_session(path)),
+        import html
+        if match:
+            query, hits, first = match
+            if first:
+                where, text = first
+                lo = text.lower().find(query.lower())
+                start = max(0, lo - 40)
+                piece = text[start:lo + len(query) + 60]
+                i = piece.lower().find(query.lower())
+                snippet = (("…" if start else "") + html.escape(piece[:i])
+                           + f"<b style='background:#fff1a8'>"
+                           f"{html.escape(piece[i:i + len(query)])}</b>"
+                           + html.escape(piece[i + len(query):])
+                           + ("…" if lo + len(query) + 60 < len(text) else ""))
+                hint = QLabel(f"<span style='color:{MUTED}'>[{html.escape(where)}]"
+                              f"</span> {snippet}"
+                              f"<span style='color:{MUTED}'>  ·  {hits} "
+                              f"match{'es' * (hits != 1)}</span>")
+                hint.setTextFormat(Qt.RichText)
+                hint.setWordWrap(True)
+                hint.setStyleSheet(f"color:{TEXT};font-size:11px;")
+                left.addWidget(hint)
+        elif has_summary and data["summary"].get("summary"):
+            gist = data["summary"]["summary"]
+            gist = gist if len(gist) < 140 else gist[:137].rsplit(" ", 1)[0] + "…"
+            g = QLabel(html.escape(gist))
+            g.setWordWrap(True)
+            g.setStyleSheet(f"color:{TEXT};font-size:11px;")
+            left.addWidget(g)
+        h.addLayout(left, 1)
+
+        focus = match[0] if match else None
+        for label, slot in (("Open", lambda: self.open_session(path, focus)),
                             ("Export", lambda: self.export_file(path)),
                             ("Delete", lambda: self.delete_session(path))):
             b = QPushButton(label)
@@ -2928,7 +3243,7 @@ class Window(QWidget):
             h.addWidget(b)
         return row
 
-    def open_session(self, path):
+    def open_session(self, path, focus=None):
         # session files are local, but a truncated or hand-edited one should
         # not take the app down
         try:
@@ -2964,12 +3279,25 @@ class Window(QWidget):
             self.cards.append(card)
         if data.get("target") in LANGUAGES:
             self.target.picker.setCurrentText(data["target"])
+        self.summary = data.get("summary") if isinstance(
+            data.get("summary"), dict) else None
+        self.summary_lines = int(data.get("summary_lines") or 0)
+        self.show_summary()
+        self.answer_box.setVisible(False)
         # viewing an old session: further edits save back to that same file
         self.session_file = path
         self.session_started = data.get("started", self.session_started)
         self.show_live()
         self.update_progress()
         log(f"opened session {os.path.basename(path)}")
+        if focus:
+            q = focus.lower()
+            for card in self.cards:
+                if q in card.text.lower() or q in card.translation.lower():
+                    QTimer.singleShot(80, lambda c=card: (
+                        self.source.scroll.ensureWidgetVisible(c, 0, 120),
+                        c.flash()))
+                    break
 
     def delete_session(self, path):
         if QMessageBox.question(
@@ -2984,7 +3312,7 @@ class Window(QWidget):
             return
         log(f"deleted {os.path.basename(path)}")
         self.status_msg("session deleted")
-        self.load_history()
+        self.load_history(self.history_search.text())
 
     def build_controls(self):
         box = QFrame()
@@ -3022,16 +3350,11 @@ class Window(QWidget):
         self.target.picker.currentTextChanged.connect(self.to_lang.setText)
 
         self.note.setText("")
-        if DEEPGRAM_ENABLED and not DEEPGRAM_KEY:
+        if not self.local and not DEEPGRAM_KEY:
             self.button.setEnabled(False)
-            self.note.setText("DEEPGRAM_API_KEY missing from .env")
-        elif not HAVE_TRANSLATION:
-            self.note.setText("no translation key in .env")
-        elif not HAVE_TRANSLATION:
-            self.note.setText("No translation key in .env - transcript only")
-        else:
-            self.note.setText(
-                f"Translating with {GEMINI_MODEL if USE_GEMINI else TRANSLATE_MODEL}")
+            self.note.setText("no Deepgram key - add one under API Keys")
+        elif not active_providers():
+            self.note.setText("no translation provider - transcript only")
         return box
 
     # -- run control --
@@ -3171,7 +3494,8 @@ class Window(QWidget):
         self.session_label.setText(
             f"  Session Active\n  Source: {self.source.lang_name().split(' (')[0]}")
 
-    def stop(self):
+    def stop(self, auto_summary=True):
+        was_recording = self.listener is not None
         if self.listener:
             self.listener.stop()
             self.listener.wait(2000)
@@ -3193,6 +3517,9 @@ class Window(QWidget):
             log(f"session saved: {os.path.basename(self.session_file or '')}")
             self.note.setText(
                 f"saved · {len(self.cards)} lines · see History")
+        if (auto_summary and was_recording and AUTO_SUMMARY
+                and len(self.spoken_lines()) > self.summary_lines):
+            self.summarize(auto=True)
 
     def tick(self):
         self.seconds += 1
@@ -3239,6 +3566,8 @@ class Window(QWidget):
         n = len(self.speakers_seen)
         self.note.setText(f"{len(self.cards)} lines"
                           + (f" · {n} speakers" if n > 1 else ""))
+        if self.summary:
+            self.show_summary()
 
     # -- click-to-translate --
 
@@ -3356,6 +3685,123 @@ class Window(QWidget):
         self.keep(worker)
         worker.start()
 
+    # -- summary --
+
+    def spoken_lines(self):
+        return [l for l in self.session_payload()["lines"]
+                if l["text"] and not l["text"].startswith("—")]
+
+    def summary_plain(self):
+        return summary_text(self.summary)
+
+    def show_summary(self):
+        if not self.summary:
+            self.summary_box.setVisible(False)
+            return
+        stale = len(self.spoken_lines()) > self.summary_lines
+        self.summary_title.setText(
+            "SUMMARY  ·  out of date" if stale else "SUMMARY")
+        self.summary_text.setTextFormat(Qt.RichText)
+        self.summary_text.setText(summary_html(self.summary))
+        self.summary_box.setVisible(True)
+
+    def summarize(self, auto=False):
+        """Overview, decisions and action items for the whole meeting."""
+        lines = self.spoken_lines()
+        if len(lines) < (SUMMARY_MIN_LINES if auto else 1):
+            if not auto:
+                self.note.setText("nothing to summarize yet")
+            return
+        if not active_providers():
+            if not auto:
+                self.note.setText("add an LLM provider under API Keys first")
+            return
+
+        target_file = self.session_file          # may change if a new
+        count = len(lines)                        # session starts meanwhile
+        self.summary_btn.setEnabled(False)
+        self.summary_btn.setText("📝  Summarizing…")
+        self.summary_box.setVisible(True)
+        self.summary_title.setText("SUMMARY")
+        self.summary_text.setTextFormat(Qt.PlainText)
+        self.summary_text.setText("Reading the meeting…")
+
+        task = LLMTask(
+            "summary",
+            SUMMARY_PROMPT.format(language=self.target.lang_name()),
+            transcript_text(lines), temperature=0.2, max_tokens=1500,
+            json_mode=True)
+        task.done.connect(lambda raw: self.on_summary(raw, target_file, count))
+        task.failed.connect(self.on_summary_failed)
+        task.finished.connect(self.reset_summary_button)
+        self.keep(task)
+        task.start()
+
+    def on_summary(self, raw, target_file, count):
+        data = parse_summary(raw)
+        if target_file and target_file != self.session_file:
+            # the user moved on to another session - file it where it belongs
+            try:
+                with open(target_file) as f:
+                    saved = json.load(f)
+                saved["summary"], saved["summary_lines"] = data, count
+                with open(target_file, "w") as f:
+                    json.dump(saved, f, ensure_ascii=False, indent=1)
+                secure_file(target_file)
+                log(f"summary saved to {os.path.basename(target_file)}")
+            except Exception as e:
+                log(f"could not attach summary: {e}")
+            return
+        self.summary, self.summary_lines = data, count
+        self.show_summary()
+        self.autosave()
+        n = len(data["action_items"])
+        self.note.setText(f"summary ready · {n} action item{'s' * (n != 1)}")
+
+    def on_summary_failed(self, err):
+        self.summary_text.setTextFormat(Qt.PlainText)
+        self.summary_text.setText(f"⚠ {err}")
+        self.note.setText("summary failed")
+
+    def reset_summary_button(self):
+        self.summary_btn.setEnabled(True)
+        self.summary_btn.setText("📝  Summarize meeting")
+
+    # -- questions about the meeting --
+
+    def ask_question(self):
+        q = self.ask_edit.text().strip()
+        if not q:
+            return
+        lines = self.spoken_lines()
+        if not lines:
+            self.note.setText("nothing has been said yet")
+            return
+        self.ask_btn.setEnabled(False)
+        self.answer_box.setVisible(True)
+        self.answer_title.setText("ANSWER")
+        self.answer_text.setTextFormat(Qt.PlainText)
+        self.answer_text.setText("Looking through the meeting…")
+        self.last_question = q
+
+        task = LLMTask(
+            "ask", ASK_PROMPT,
+            f"Transcript:\n{transcript_text(lines)}\n\nQuestion: {q}",
+            temperature=0.2, max_tokens=500)
+        task.done.connect(self.on_answer)
+        task.failed.connect(lambda err: self.on_answer(f"⚠ {err}"))
+        task.finished.connect(lambda: self.ask_btn.setEnabled(True))
+        self.keep(task)
+        task.start()
+
+    def on_answer(self, text):
+        import html
+        q = html.escape(getattr(self, "last_question", ""))
+        self.answer_text.setTextFormat(Qt.RichText)
+        self.answer_text.setText(
+            f"<p style='margin:0 0 6px 0;color:{MUTED};font-style:italic'>{q}</p>"
+            f"<p style='margin:0;line-height:140%'>{html.escape(text)}</p>")
+
     def on_reply(self, text):
         text = text.strip().strip('"')
         self.reply_text.setText(text)
@@ -3432,7 +3878,7 @@ class Window(QWidget):
         self.translate_btn.setEnabled(left > 0 or bad > 0)
 
     def closeEvent(self, e):
-        self.stop()
+        self.stop(auto_summary=False)
         if self.cards:
             self.autosave()
         elif self.session_file and os.path.exists(self.session_file):
